@@ -5,11 +5,11 @@ import pathlib
 import shutil
 import requests
 
-import numpy as np
 import polars as pl
 import tensorflow as tf
 
 from typing import Optional, Dict, Union, Tuple
+from tqdm import tqdm
 
 ML_25M_URL = "https://files.grouplens.org/datasets/movielens/ml-25m.zip"
 BATCH_SIZE = 1_000_000
@@ -27,21 +27,24 @@ def preprocess(local_directory: pathlib.Path, logger: logging.Logger):
     logger.info("Load movie metadata")
     movies = load_movie_metadata(archive_path)
 
-    logger.info("Generate index maps on movie, genre from metadata")
-    movie_index_map = define_metadata_index_map(movies, "movieId")
-    genre_index_map = define_metadata_index_map(movies, "genres")
+    logger.info("Load user-movie rating log data")
+    ratings = load_ratings_data(archive_path)
 
-    logger.info("Convert genre names in metadata into padded list of indices")
+    logger.info("Generate index maps on movie, genre from metadata")
+    user_index_map = define_index_map(ratings, "userId")
+    movie_index_map = define_index_map(movies, "movieId")
+    genre_index_map = define_index_map(movies, "genres")
+
+    logger.info("Convert genre names in metadata into list of indices")
     movies = convert_movie_metadata(movies, movie_index_map, genre_index_map)
-    movies = pad_zeros_to_genre(movies)
 
     logger.info("Join metadata into user ratings data")
-    ratings = construct_ratings_data(movies, movie_index_map, archive_path)
+    ratings = construct_ratings_data(movies, ratings, user_index_map, movie_index_map)
 
     logger.info("Split ratings data and save each data as TFRecord file")
     train_data, validation_data = split_ratings(ratings)
-    save_data_as_tfrecords(train_data, TRAIN_DATA_DIR, local_directory, logger)
-    save_data_as_tfrecords(validation_data, VALIDATION_DATA_DIR, local_directory, logger)
+    save_data_as_tfrecords(train_data, TRAIN_DATA_DIR, local_directory)
+    save_data_as_tfrecords(validation_data, VALIDATION_DATA_DIR, local_directory)
 
     logger.info("Save index maps as json format")
     save_index_map(movie_index_map, MOVIE_INDEX_MAP_FILE_NAME, local_directory)
@@ -108,20 +111,36 @@ def load_movie_metadata(archive_path: pathlib.Path) -> pl.DataFrame:
     )
 
 
-def define_metadata_index_map(
-    movies: pl.DataFrame, column_name: str
-) -> Dict[Union[str, int], int]:
+def load_ratings_data(archive_path: pathlib.Path) -> pl.DataFrame:
     """
-    Extract unique items of a submitted column in metadata and convert them into index
+    Load ratings
 
     Args:
-        movies: dataframe that contains genre information of each movie
-        column_name: name of column to map each value of item into index
+        archive_path: pathlib.Path of unpacked movielens archive
+
+    Returns:
+        dataframe that contains log data on user-movie rating
+    """
+    return (
+        pl.read_csv(archive_path / "ratings.csv")
+        .select(["userId", "movieId", "rating"])
+    )
+
+
+def define_index_map(
+    data: pl.DataFrame, column_name: str
+) -> Dict[Union[str, int], int]:
+    """
+    Extract unique items of a submitted column in the data and convert them into index
+
+    Args:
+        data: dataframe that contains column to be converted into index
+        column_name: name of column whose value will be converted into index
 
     Returns:
         dict from item to corresponding index
     """
-    idx2item = dict(enumerate(movies[column_name].unique(), start=1))  # 0 is reserved for padding index
+    idx2item = dict(enumerate(data[column_name].unique()))
     return dict([(item, idx) for idx, item in idx2item.items()])
 
 
@@ -129,7 +148,7 @@ def convert_movie_metadata(
     movies: pl.DataFrame, movie_index_map: Dict[int, int], genre_index_map: Dict[str, int]
 ) -> pl.DataFrame:
     """
-    Convert movieId into movie index and genre names into padded list of genre indices
+    Convert movieId into movie index and genre names into list of genre indices
 
     Args:
         movies: dataframe that contains genre information of each movie as name
@@ -150,50 +169,30 @@ def convert_movie_metadata(
     )
 
 
-def pad_zeros_to_genre(movies: pl.DataFrame):
-    """
-    Pad zeros to genres to equalize variable length of genre index list
-
-    Args:
-        movies: dataframe of movie index and list genre indices
-
-    Returns:
-        dataframe of movie index and list of zero-padded genre indices
-    """
-    pad_size = movies.select(pl.col("genres").arr.lengths()).max().to_dicts()[0]["genres"]
-    num_movies = len(movies)
-    movie_ids = np.arange(1, num_movies + 1).repeat(pad_size)
-    padding_data = pl.DataFrame({
-        "movieId": movie_ids,
-        "padding": np.zeros(len(movie_ids), dtype=int)
-    }).groupby("movieId").agg_list()
-    return (
-        movies.join(padding_data, on="movieId").select([
-            "movieId", pl.col("genres").arr.concat("padding").arr.head(pad_size)
-        ])
-    )
-
-
 def construct_ratings_data(
     movies: pl.DataFrame,
+    ratings: pl.DataFrame,
+    user_index_map: Dict[int, int],
     movie_index_map: Dict[int, int],
-    archive_path: pathlib.Path
 ) -> pl.DataFrame:
     """
     Attach list of genre indices on ratings matrix
 
     Args:
         movies: metadata of each movie containing its genre information of index list
+        ratings: data that contains columns of userId, movieId and corresponding rating
+        user_index_map: index map from userId to corresponding index
         movie_index_map: index map from movieId to corresponding index
-        archive_path: pathlib.Path of unpacked movielens archive
 
     Returns:
-        user rating data with movie index and corresponding list of padded genre indices
+        user rating data with movie index and corresponding list of genre indices
     """
     return (
-        pl.read_csv(archive_path / "ratings.csv")
-        .select(["userId", "movieId", "rating"])
-        .with_column(pl.col("movieId").apply(lambda x: movie_index_map[x]))
+        ratings
+        .with_columns([
+            (pl.col("userId").apply(lambda x: user_index_map[x])),
+            (pl.col("movieId").apply(lambda x: movie_index_map[x]))
+        ])
         .join(movies, on="movieId", how="inner")
     )
 
@@ -203,7 +202,7 @@ def split_ratings(ratings: pl.DataFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
     split ratings data into two partitions which represents train, validation data respectively
 
     Args:
-        ratings: user rating data with movie index and corresponding list of padded genre indices
+        ratings: user rating data with movie index and corresponding list of genre indices
 
     Returns:
         two partitions of ratings data
@@ -217,7 +216,6 @@ def save_data_as_tfrecords(
     ratings: pl.DataFrame,
     directory_name: str,
     local_directory: pathlib.Path,
-    logger: logging.Logger
 ) -> None:
     """
     convert and save submitted ratings partition into TFRecord format
@@ -226,13 +224,10 @@ def save_data_as_tfrecords(
         ratings: user rating data with movie index and corresponding list of padded genre indices
         directory_name: name of data directory to save partitions of submitted ratings data
         local_directory: root directory of data directory
-        logger: logger to print status of converting process
     """
     data_directory = local_directory.joinpath(directory_name)
     data_directory.mkdir(exist_ok=True, parents=True)
-    num_partition = len(ratings) // BATCH_SIZE + 1
-    for index, pointer in enumerate(range(0, len(ratings), BATCH_SIZE), start=1):
-        logger.info(f"Fill {directory_name} ({index}/{num_partition})")
+    for index, pointer in tqdm(enumerate(range(0, len(ratings), BATCH_SIZE), start=1)):
         ratings_partition = ratings[pointer:(pointer + BATCH_SIZE)]
         file_path = data_directory.joinpath(f"partition_{index:02}.tfrecord")
         _convert_partition_into_tfrecord_file(ratings_partition, str(file_path))
@@ -267,3 +262,28 @@ def save_index_map(
     """
     with open(local_directory.joinpath(file_name), "w") as file:
         json.dump(index_map, file)
+
+
+# Following train process accepts variable length sequence of genres as variable length tensor, this became unnecessary.
+# def pad_zeros_to_genre(movies: pl.DataFrame):
+#     """
+#     Pad zeros to genres to equalize variable length of genre index list
+#
+#     Args:
+#         movies: dataframe of movie index and list genre indices
+#
+#     Returns:
+#         dataframe of movie index and list of zero-padded genre indices
+#     """
+#     pad_size = movies.select(pl.col("genres").arr.lengths()).max().to_dicts()[0]["genres"]
+#     num_movies = len(movies)
+#     movie_ids = np.arange(1, num_movies + 1).repeat(pad_size)
+#     padding_data = pl.DataFrame({
+#         "movieId": movie_ids,
+#         "padding": np.zeros(len(movie_ids), dtype=int)
+#     }).groupby("movieId").agg_list()
+#     return (
+#         movies.join(padding_data, on="movieId").select([
+#             "movieId", pl.col("genres").arr.concat("padding").arr.head(pad_size)
+#         ])
+#     )
